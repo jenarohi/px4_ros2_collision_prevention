@@ -1,0 +1,33 @@
+/**:
+  ros__parameters:
+    # ── Publish rate ──────────────────────────────────────────────────────────
+    # PX4 Collision Prevention requires at least 10 Hz.
+    # 15 Hz gives comfortable margin. Going beyond 30 Hz wastes CPU.
+    publish_hz: 15.0
+
+    # ── Sensor range ──────────────────────────────────────────────────────────
+    # D435 reliable range: 0.2 m – 10 m (depth stream, default preset)
+    min_depth_m: 0.20
+    max_depth_m: 10.0
+
+    # ── Camera geometry ───────────────────────────────────────────────────────
+    # D435 / D435i horizontal FOV = 87° (depth stream, default resolution)
+    fov_h_deg: 87.0
+
+    # 72 bins = 5° per bin = full 360° coverage
+    # Bins outside the camera FOV will be UINT16_MAX (unknown = no obstacle)
+    num_bins: 72
+
+    # ── Post-processing ───────────────────────────────────────────────────────
+    # RealSense decimation + spatial + temporal filters significantly reduce
+    # depth noise, especially at medium/long range. Adds ~2 ms latency.
+    use_filters: true
+
+    # ── Depth stream resolution ───────────────────────────────────────────────
+    depth_width:  640
+    depth_height: 480
+    depth_fps:    30
+
+    # ── SITL testing ──────────────────────────────────────────────────────────
+    # Set true to inject a synthetic 2 m obstacle ahead. Use with SITL only.
+    simulate_depth: false

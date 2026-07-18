@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>px4_ros2_collision_prevention</name>
+  <version>1.0.0</version>
+  <description>
+    ROS 2 Humble node that converts RealSense D435/D435i depth frames into
+    px4_msgs/ObstacleDistance messages published to /fmu/in/obstacle_distance.
+    PX4's built-in Collision Prevention module reads this topic (via uXRCE-DDS)
+    and brakes the vehicle when an obstacle enters the CP_DIST envelope.
+    Works with PX4 firmware >= v1.14.
+  </description>
+
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>px4_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
