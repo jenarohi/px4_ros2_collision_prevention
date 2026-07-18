@@ -34,10 +34,12 @@ def depth_row_to_bins(row_uint16: np.ndarray,
     """
     Pure Python replica of RealSenseObstacleNode._depth_frame_to_bins().
     Takes a 1D uint16 row (one row from the depth image) and returns bins_cm.
+
+    Fix applied: invalid pixels (zero / below min / above max) are SKIPPED
+    entirely — their bins stay at UINT16_MAX. They are NOT written as max_m.
     """
     row_m = row_uint16.astype(np.float32) * depth_scale
-    invalid = (row_m == 0) | (row_m < MIN_M) | (row_m > MAX_M)
-    row_m[invalid] = MAX_M
+    valid_mask = (row_m > 0) & (row_m >= MIN_M) & (row_m <= MAX_M)
 
     bins_cm = np.full(NUM_BINS, UINT16_MAX, dtype=np.uint16)
     num_cols = len(row_m)
@@ -45,8 +47,10 @@ def depth_row_to_bins(row_uint16: np.ndarray,
     col_idx = np.arange(num_cols)
     angles  = ANGLE_OFFSET + (col_idx / num_cols) * FOV_H_DEG
     b_idx   = (np.round(angles % 360 / INCREMENT_DEG).astype(int) % NUM_BINS)
-    dist_cm = np.minimum((row_m * 100).astype(np.uint16), 65534)
-    np.minimum.at(bins_cm, b_idx, dist_cm)
+
+    valid_bins    = b_idx[valid_mask]
+    valid_dist_cm = np.minimum((row_m[valid_mask] * 100).astype(np.uint16), 65534)
+    np.minimum.at(bins_cm, valid_bins, valid_dist_cm)
 
     return bins_cm
 
@@ -66,17 +70,20 @@ class TestBinCount:
 
 
 class TestUnknownBins:
-    def test_zero_pixels_become_max_range_not_unknown(self):
+    def test_zero_pixels_stay_unknown(self):
         """
-        Zero depth (no return) should map to MAX_M (sensor max),
-        which then maps to max_distance cm — NOT UINT16_MAX.
-        This means "no obstacle detected" at max range.
+        BUG FIX: Zero-depth pixels (no IR return) should produce UINT16_MAX
+        (unknown), NOT max_distance cm.
+        A zero return on the D435 often means a black/reflective surface at
+        close range — falsely reporting that as "10 m clear" is dangerous.
         """
         row = np.zeros(WIDTH, dtype=np.uint16)
         result = depth_row_to_bins(row)
-        # All filled bins should be at max distance
-        filled = result[result < UINT16_MAX]
-        assert np.all(filled == int(MAX_M * 100))
+        # ALL bins must stay unknown — no valid data was provided
+        assert np.all(result == UINT16_MAX), (
+            f'Expected all bins to be UINT16_MAX, but got non-unknown values: '
+            f'{result[result != UINT16_MAX]}'
+        )
 
     def test_bins_outside_fov_remain_uint16_max(self):
         """
@@ -109,14 +116,19 @@ class TestDistanceConversion:
         filled = result[result < UINT16_MAX]
         assert len(filled) > 0
 
-    def test_obstacle_below_min_range_treated_as_max(self):
-        """Values below min_depth_m should be treated as max distance (ignored)."""
+    def test_obstacle_below_min_range_stays_unknown(self):
+        """
+        BUG FIX: Values below min_depth_m should produce UINT16_MAX (unknown),
+        NOT be reported as max_distance.
+        These are D435 unreliable readings, not confirmed-clear space.
+        """
         val = int(0.05 / DEPTH_SCALE)  # 5 cm — too close, below min
         row = np.full(WIDTH, val, dtype=np.uint16)
         result = depth_row_to_bins(row)
-        filled = result[result < UINT16_MAX]
-        # Should be max distance (no obstacle)
-        assert np.all(filled == int(MAX_M * 100))
+        # All bins must be unknown — the sensor can't reliably measure this
+        assert np.all(result == UINT16_MAX), (
+            'Below-min-range pixels must produce UINT16_MAX, not max_distance'
+        )
 
     def test_minimum_distance_wins_in_bin(self):
         """
@@ -143,6 +155,35 @@ class TestGeometry:
         result = depth_row_to_bins(row)
         # Bin 0 is forward — should have a valid reading
         assert result[0] < UINT16_MAX, 'Forward bin (0) should be populated'
+
+    def test_angle_offset_0_means_bin0_is_forward(self):
+        """
+        Confirms the angle_offset=0 contract:
+        bin 0 must contain the reading from the camera centre (forward).
+
+        This verifies the BUG FIX: the old code published angle_offset=-43.5
+        but filled bin 0 with forward data, causing a 9-bin (~43.5°) mismatch
+        in PX4's Collision Prevention sector lookup.
+
+        With the fix: bin 0 = forward reading, angle_offset published = 0.0.
+        PX4 will correctly associate bin 0 with 0° (straight ahead).
+        """
+        # Centre pixel = exactly 2 m ahead
+        row = np.full(WIDTH, int(MAX_M / DEPTH_SCALE), dtype=np.uint16)  # far
+        centre = WIDTH // 2
+        row[centre - 2 : centre + 2] = int(2.0 / DEPTH_SCALE)           # 2 m
+
+        result = depth_row_to_bins(row)
+
+        # Bin 0 should be the minimum (2 m = 200 cm)
+        assert result[0] <= 200, (
+            f'Bin 0 (forward) should have the 200 cm reading, got {result[0]}'
+        )
+        # Bin 9 (≈43.5° offset) should NOT have the forward reading
+        # (this is what the old buggy code would have caused)
+        assert result[9] > 200 or result[9] == UINT16_MAX, (
+            'Bin 9 should NOT contain the forward reading (that was the bug)'
+        )
 
     def test_no_negative_distances(self):
         """No bin should have a distance below min_distance."""

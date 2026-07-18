@@ -116,12 +116,13 @@ class RealSenseObstacleNode(Node):
         self._increment_deg = 360.0 / self._num_bins          # 5.0°
         self._angle_offset  = -self._fov_h / 2.0              # −43.5°
 
-        # ── QoS: PX4 expects BEST_EFFORT on inbound topics ───────────────────
-        # Using BEST_EFFORT on the publisher ensures the uXRCE-DDS bridge
-        # doesn't drop messages due to QoS mismatch.
+        # ── QoS: match the standard PX4 /fmu/in/* profile ────────────────────
+        # BEST_EFFORT + VOLATILE matches what the uXRCE-DDS bridge expects.
+        # TRANSIENT_LOCAL is valid DDS but atypical for this bridge and adds
+        # unnecessary overhead — confirmed by PX4 ROS2 examples.
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -279,31 +280,40 @@ class RealSenseObstacleNode(Node):
         # Convert raw units → metres (vectorised, fast)
         row_m = mid_row.astype(np.float32) * self._depth_scale
 
-        # Pixels that read 0 (no return) or beyond sensor limits → treat as max
-        invalid_mask = (row_m == 0) | (row_m < self._min_m) | (row_m > self._max_m)
-        row_m[invalid_mask] = self._max_m
+        # Mark invalid pixels: zero (no IR return), below min, or above max.
+        # NOTE: Do NOT replace invalid pixels with max_m.
+        # A zero return from the D435 often means a black/reflective surface
+        # at close range — treating it as "10 m clear" is a dangerous lie.
+        # Instead, keep those bins as UINT16_MAX (unknown), which tells PX4
+        # "I have no reliable data here" — a conservative, correct choice.
+        valid_mask = (row_m > 0) & (row_m >= self._min_m) & (row_m <= self._max_m)
 
-        # Initialise all bins as UNKNOWN
+        # Initialise all bins as UNKNOWN (UINT16_MAX)
         bins_cm = np.full(self._num_bins, UINT16_MAX, dtype=np.uint16)
 
         num_cols = len(row_m)
-        fov_start = self._angle_offset   # −43.5°
 
-        # Map each pixel column → angular bin
-        # col=0 → fov_start, col=num_cols-1 → fov_start + FOV_H
+        # Map each pixel column → forward-referenced angular bin
+        # bin math: col=0 → left edge of FOV, centre col → 0° (forward)
+        # The resulting angles are forward-referenced (0° = forward).
+        # msg.angle_offset is therefore published as 0.0 — see _publish().
         col_indices = np.arange(num_cols)
-        angles = fov_start + (col_indices / num_cols) * self._fov_h
+        angles = self._angle_offset + (col_indices / num_cols) * self._fov_h
 
-        # Bin indices (0-indexed, clockwise)
+        # Bin indices (0-indexed, mod-360 → clockwise, 0 = forward)
         bin_indices = (np.round(angles % 360 / self._increment_deg)
                        .astype(int) % self._num_bins)
 
-        # Convert to cm (clamped below UINT16_MAX so sentinel is unambiguous)
-        dist_cm = np.minimum((row_m * 100).astype(np.uint16), 65534)
+        # Only scatter VALID pixels into bins — invalid pixels are skipped
+        # entirely so their bins stay at UINT16_MAX (unknown), not max_m.
+        valid_col_idx = col_indices[valid_mask]
+        valid_bins    = bin_indices[valid_mask]
+        valid_dist_cm = np.minimum(
+            (row_m[valid_mask] * 100).astype(np.uint16), 65534
+        )
 
-        # Scatter-minimum into bins
-        # np.minimum.at performs "unbuffered" minimum reduction
-        np.minimum.at(bins_cm, bin_indices, dist_cm)
+        # Scatter-minimum: keep the closest reading per bin
+        np.minimum.at(bins_cm, valid_bins, valid_dist_cm)
 
         return bins_cm
 
@@ -351,7 +361,14 @@ class RealSenseObstacleNode(Node):
         msg.increment     = float(self._increment_deg)
         msg.min_distance  = int(self._min_m * 100)   # cm
         msg.max_distance  = int(self._max_m * 100)   # cm
-        msg.angle_offset  = float(self._angle_offset)
+        # angle_offset MUST be 0.0 here.
+        # Our bin-filling math uses mod-360 indexing where bin 0 = 0° = forward.
+        # Publishing self._angle_offset (-43.5°) would tell PX4 that bin 0 is
+        # 43.5° left of forward — a mismatch that causes PX4's Collision
+        # Prevention to check the wrong sector for a straight-ahead obstacle.
+        # (Bug confirmed by code review: the bin math and angle_offset were
+        # computed independently and contradicted each other.)
+        msg.angle_offset  = 0.0
 
         self._pub.publish(msg)
 
