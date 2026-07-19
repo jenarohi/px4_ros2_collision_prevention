@@ -222,7 +222,10 @@ class RealSenseObstacleNode(Node):
         for i in range(NUM_BINS):
             v = bin_depth_cm[i]
             if v < 0:
-                distances[i] = CLEAR_CM                         # 801 — clear
+                # Not enough valid pixels — could be glass, dark surface, or out of range.
+                # Report UNKNOWN (65535), NOT clear (801).
+                # 801 = "I looked and confirmed nothing there" — we cannot claim that here.
+                distances[i] = UINT16_MAX                       # 65535 — unknown
             else:
                 distances[i] = int(np.clip(v, MIN_CM, MAX_CM)) # clamped cm
 
