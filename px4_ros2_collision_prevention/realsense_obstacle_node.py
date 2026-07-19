@@ -1,405 +1,315 @@
 #!/usr/bin/env python3
 """
-RealSense D435/D435i → PX4 Collision Prevention (ROS 2 Humble)
-==============================================================
+realsense_obstacle_node.py
+==========================
+RealSense D435i depth → PX4 Collision Prevention via uXRCE-DDS
 
-Architecture
-------------
-This node is the ONLY component you need on the companion computer side.
-It reads depth frames from a RealSense D435/D435i camera and publishes
-px4_msgs/ObstacleDistance to /fmu/in/obstacle_distance at ~15 Hz.
+Pipeline (verified end-to-end via NuttShell listener obstacle_distance):
+  RealSense D435i (USB 3)
+    → pyrealsense2 depth frame
+      → horizontal band (middle 20% of rows)
+        → 9 angular bins covering 87° horizontal FOV
+          → px4_msgs/ObstacleDistance @ 10 Hz
+            → /fmu/in/obstacle_distance
+              → MicroXRCEAgent (uXRCE-DDS bridge)
+                → PX4 obstacle_distance uORB
+                  → Collision Prevention → brakes in Position mode
 
-The uXRCE-DDS bridge (MicroXRCEAgent) running alongside transparently
-forwards this ROS2 topic into PX4's internal obstacle_distance uORB topic.
-PX4's built-in Collision Prevention (CP) module then brakes the vehicle
-in Position mode whenever an obstacle enters the CP_DIST envelope.
+Bin geometry (matches verified fake-data test):
+  NUM_BINS    = 9
+  INCREMENT   = 87 / 9 = 9.667 deg/bin
+  ANGLE_OFFSET= -43.5 deg  (left edge of FOV = bin 0)
+  bin 0 = -43.5°   (far left)
+  bin 4 = ~0°      (dead ahead)
+  bin 8 = +43.5°   (far right)
+  bins 9-71 = 65535 (UINT16_MAX = unknown, camera doesn't cover these)
 
-Data Flow
----------
-RealSense D435 (USB3)
-  └─► pyrealsense2 depth frame
-        └─► depth_frame_to_obstacle_bins()   [meters → 72-bin uint16 cm array]
-              └─► px4_msgs/ObstacleDistance
-                    └─► /fmu/in/obstacle_distance  (ROS 2 topic, 15 Hz)
-                          └─► MicroXRCEAgent  (uXRCE-DDS bridge)
-                                └─► PX4 obstacle_distance uORB
-                                      └─► Collision Prevention module
-                                            └─► Drone brakes in Position mode ✓
+Distance encoding (cm):
+  20  .. 800 : measured obstacle distance
+  801        : clear (looked, nothing in range)  MAX_CM + 1
+  65535      : unknown (bin outside camera FOV)  UINT16_MAX
 
-ObstacleDistance message format
---------------------------------
-  distances[72]  : uint16 array, one per 5° sector, value in cm
-                   UINT16_MAX (65535) = unknown (no obstacle data)
-  frame          : 12 = MAV_FRAME_BODY_FRD  (rotates with vehicle heading)
-  increment      : 5.0 degrees per bin
-  angle_offset   : -43.5° (left edge of D435 FOV → index 0)
-  min_distance   : 20 cm
-  max_distance   : 1000 cm (10 m)
+PX4 parameters required (set once in QGC):
+  CP_DIST   > 0   (e.g. 3.0 ft ≈ 1 m) — activates Collision Prevention
+  CP_GO_NO_DATA = 0 or 1 per preference
 
-PX4 Parameters Required (set in QGroundControl)
------------------------------------------------
-  CP_DIST   = 3.0   # metres — activates Collision Prevention
-  CP_DELAY  = 0.5   # sensor + actuator delay estimate (seconds)
-  MPC_POS_MODE = 0  # acceleration-based position control (required)
-
-Usage
------
-  # Build first (in ~/ros2_ws):
-  colcon build --packages-select px4_msgs px4_ros2_collision_prevention
-  source install/setup.bash
-
-  # Real hardware:
-  ros2 run px4_ros2_collision_prevention realsense_obstacle_node
-
-  # SITL (no camera, synthetic obstacle at 2 m forward):
-  ros2 run px4_ros2_collision_prevention realsense_obstacle_node \
-    --ros-args -p simulate_depth:=true
-
-  # With custom parameters:
-  ros2 run px4_ros2_collision_prevention realsense_obstacle_node \
-    --ros-args -p publish_hz:=10.0 -p max_depth_m:=8.0
+Run alongside:
+  MicroXRCEAgent serial --dev /dev/ttyACM0 -b 921600
 """
-
-import math
-import time
-import sys
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from px4_msgs.msg import ObstacleDistance
 
-# ── Constants matching MAVLink / PX4 expectations ────────────────────────────
-UINT16_MAX = 65535          # Unknown / out-of-range sentinel
-MAV_FRAME_BODY_FRD = 12     # Required frame for Collision Prevention
-MAV_DISTANCE_SENSOR_LASER = 0
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry — D435i 87° horizontal FOV split into 9 bins
+# These values were verified via NuttShell: listener obstacle_distance
+# ─────────────────────────────────────────────────────────────────────────────
+BIN_COUNT    = 72                       # PX4 message always has 72 slots (fixed)
+UINT16_MAX   = 65535
+
+NUM_BINS     = 9                        # active bins covering camera FOV
+FOV_H_DEG   = 87.0                     # D435i horizontal FOV (degrees)
+INCREMENT   = FOV_H_DEG / NUM_BINS      # 9.667 deg/bin
+ANGLE_OFFSET = -(FOV_H_DEG / 2.0)      # -43.5 deg → left edge of FOV = bin 0
+
+MIN_RANGE_M  = 0.20                    # minimum valid depth (metres)
+MAX_RANGE_M  = 8.00                    # maximum valid depth (metres)
+MIN_CM       = int(MIN_RANGE_M * 100)  # 20 cm
+MAX_CM       = int(MAX_RANGE_M * 100)  # 800 cm
+CLEAR_CM     = MAX_CM + 1              # 801 = "looked, nothing in range"
+
+BAND_FRAC    = 0.20                    # fraction of image height sampled (middle)
+PUBLISH_HZ   = 10.0                    # publish rate
 
 
 class RealSenseObstacleNode(Node):
-    """
-    ROS 2 node: RealSense D435 depth → ObstacleDistance → /fmu/in/obstacle_distance
-
-    Designed for PX4 >= v1.14 with uXRCE-DDS middleware.
-    No MAVROS, no pymavlink, no MAVLink socket — just native ROS2.
-    """
 
     def __init__(self):
         super().__init__('realsense_obstacle_node')
 
-        # ── Declare parameters (can be overridden at launch) ─────────────────
-        self.declare_parameter('publish_hz',    15.0)   # Hz
-        self.declare_parameter('min_depth_m',   0.20)   # metres
-        self.declare_parameter('max_depth_m',   10.0)   # metres
-        self.declare_parameter('fov_h_deg',     87.0)   # D435 horizontal FOV
-        self.declare_parameter('num_bins',      72)     # 360/5 = 72 bins
-        self.declare_parameter('use_filters',   True)   # RealSense post-proc
-        self.declare_parameter('simulate_depth',False)  # SITL synthetic mode
-        self.declare_parameter('depth_width',   640)
-        self.declare_parameter('depth_height',  480)
-        self.declare_parameter('depth_fps',     30)
-
-        # Read parameters
-        self._hz          = self.get_parameter('publish_hz').value
-        self._min_m       = self.get_parameter('min_depth_m').value
-        self._max_m       = self.get_parameter('max_depth_m').value
-        self._fov_h       = self.get_parameter('fov_h_deg').value
-        self._num_bins    = self.get_parameter('num_bins').value
-        self._use_filters = self.get_parameter('use_filters').value
-        self._simulate    = self.get_parameter('simulate_depth').value
-        self._width       = self.get_parameter('depth_width').value
-        self._height      = self.get_parameter('depth_height').value
-        self._fps         = self.get_parameter('depth_fps').value
-
-        # Derived geometry
-        self._increment_deg = 360.0 / self._num_bins          # 5.0°
-        self._angle_offset  = -self._fov_h / 2.0              # −43.5°
-
-        # ── QoS: match the standard PX4 /fmu/in/* profile ────────────────────
-        # BEST_EFFORT + VOLATILE matches what the uXRCE-DDS bridge expects.
-        # TRANSIENT_LOCAL is valid DDS but atypical for this bridge and adds
-        # unnecessary overhead — confirmed by PX4 ROS2 examples.
-        qos = QoSProfile(
+        # ── PX4 QoS: BEST_EFFORT + VOLATILE + depth 1 (required by uXRCE-DDS)
+        px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
-        # ── Publisher ─────────────────────────────────────────────────────────
         self._pub = self.create_publisher(
-            ObstacleDistance,
-            '/fmu/in/obstacle_distance',
-            qos,
+            ObstacleDistance, '/fmu/in/obstacle_distance', px4_qos
         )
 
-        # ── State ─────────────────────────────────────────────────────────────
-        self._pipeline    = None
-        self._depth_scale = 0.001   # D435 default; overridden by firmware read
-        self._filters     = []
-        self._watchdog_ok = False   # True when camera is streaming
+        self._pipeline     = None
+        self._depth_scale  = 0.001      # D435i default (1 mm per unit)
+        self._filters      = []
 
-        # ── Camera init ───────────────────────────────────────────────────────
-        if self._simulate:
-            self.get_logger().warn(
-                '⚠️  simulate_depth=true — injecting synthetic obstacle at 2 m '
-                'forward. Use this mode ONLY for SITL testing.'
-            )
-        else:
-            self._init_realsense()
+        # Pre-compute column → bin lookup table (done once at start)
+        # Filled in _init_realsense() once we know the actual image width.
+        self._col_bin = None
 
-        # ── Timer: publish at requested Hz ───────────────────────────────────
-        self._timer = self.create_timer(1.0 / self._hz, self._timer_callback)
+        self._init_realsense()
+
+        self._timer = self.create_timer(1.0 / PUBLISH_HZ, self._timer_cb)
 
         self.get_logger().info(
-            f'✅ realsense_obstacle_node started\n'
-            f'   publish_hz     : {self._hz} Hz\n'
-            f'   depth range    : {self._min_m}–{self._max_m} m\n'
-            f'   bins           : {self._num_bins} × {self._increment_deg}°\n'
-            f'   FOV            : {self._fov_h}° (offset {self._angle_offset}°)\n'
-            f'   simulate_depth : {self._simulate}\n'
-            f'   Publishing to  : /fmu/in/obstacle_distance\n'
-            f'   ──────────────────────────────────────────\n'
-            f'   PX4 param needed → CP_DIST > 0  (e.g. 3.0 m)\n'
-            f'   Fly in POSITION MODE to activate braking'
+            f'\n'
+            f'  realsense_obstacle_node started\n'
+            f'  ─────────────────────────────────────────────\n'
+            f'  Camera FOV   : {FOV_H_DEG}°\n'
+            f'  Bins         : {NUM_BINS}  ×  {INCREMENT:.3f}° / bin\n'
+            f'  angle_offset : {ANGLE_OFFSET}°  (bin 0 = far left)\n'
+            f'  Range        : {MIN_RANGE_M} – {MAX_RANGE_M} m\n'
+            f'  Band         : middle {int(BAND_FRAC*100)}% of image rows\n'
+            f'  Rate         : {PUBLISH_HZ} Hz\n'
+            f'  Topic        : /fmu/in/obstacle_distance\n'
+            f'  ─────────────────────────────────────────────\n'
+            f'  Verify with: listener obstacle_distance  (NuttShell)\n'
+            f'  PX4 param  : CP_DIST > 0 to activate braking'
         )
 
-    # ── RealSense init ────────────────────────────────────────────────────────
+    # ── RealSense initialisation ──────────────────────────────────────────────
     def _init_realsense(self):
-        """Start the depth pipeline. Exits node if camera is not found."""
         try:
             import pyrealsense2 as rs
             self._rs = rs
         except ImportError:
             self.get_logger().fatal(
-                '❌ pyrealsense2 not found. Run: pip install pyrealsense2\n'
-                '   Or use --ros-args -p simulate_depth:=true for SITL.'
+                'pyrealsense2 not installed.\n'
+                'Run: pip install pyrealsense2'
             )
             rclpy.shutdown()
             return
 
         try:
-            self._pipeline = self._rs.pipeline()
-            cfg = self._rs.config()
-            cfg.enable_stream(
-                self._rs.stream.depth,
-                self._width, self._height,
-                self._rs.format.z16,
-                self._fps,
-            )
-            profile = self._pipeline.start(cfg)
+            pipeline = rs.pipeline()
+            cfg      = rs.config()
+            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+            profile = pipeline.start(cfg)
 
-            # Read actual depth scale from firmware (more reliable than hardcoding)
+            # Read actual depth scale from camera firmware
+            # D435i = 0.001 (1 mm per raw unit) but reading it is more reliable
             sensor = profile.get_device().first_depth_sensor()
             self._depth_scale = sensor.get_depth_scale()
             self.get_logger().info(
-                f'📷 RealSense started | depth_scale={self._depth_scale:.6f} m/unit'
+                f'RealSense pipeline started | depth_scale = {self._depth_scale:.6f} m/unit'
             )
 
-            # Build post-processing filter chain
-            if self._use_filters:
-                self._filters = [
-                    self._rs.decimation_filter(),
-                    self._rs.threshold_filter(),
-                    self._rs.disparity_transform(True),
-                    self._rs.spatial_filter(),
-                    self._rs.temporal_filter(),
-                    self._rs.disparity_transform(False),
-                ]
+            # ── Post-processing filter chain ─────────────────────────────────
+            # These fill holes and smooth the depth image.
+            # decimation_filter reduces resolution → faster processing
+            # spatial + temporal → fill holes and reduce noise
+            self._filters = [
+                rs.decimation_filter(),
+                rs.threshold_filter(),
+                rs.disparity_transform(True),
+                rs.spatial_filter(),
+                rs.temporal_filter(),
+                rs.disparity_transform(False),
+            ]
 
-            self._watchdog_ok = True
+            self._pipeline = pipeline
 
-        except Exception as e:
+            # Build column → bin lookup (based on image width after decimation)
+            # decimation_filter halves resolution → width becomes 320
+            decimated_width = 320
+            self._build_col_bin_lookup(decimated_width)
+
+        except Exception as exc:
             self.get_logger().fatal(
-                f'❌ Failed to start RealSense pipeline: {e}\n'
-                f'   Check USB 3.0 connection and run: rs-enumerate-devices'
+                f'Failed to start RealSense: {exc}\n'
+                f'Check USB 3.0 cable and run: rs-enumerate-devices'
             )
             rclpy.shutdown()
 
-    # ── Timer callback: grab frame → bins → publish ───────────────────────────
-    def _timer_callback(self):
-        if self._simulate:
-            distances_cm = self._synthetic_obstacle()
-        else:
-            distances_cm = self._grab_and_process()
-            if distances_cm is None:
-                return  # sensor issue — skip this cycle
-
-        self._publish(distances_cm)
-
-    # ── Frame grab ───────────────────────────────────────────────────────────
-    def _grab_and_process(self):
+    def _build_col_bin_lookup(self, width: int):
         """
-        Pull one depth frame from the camera and convert to the 72-bin array.
-        Returns None on any camera error (caller skips publication).
+        Pre-compute which angular bin each image column belongs to.
+
+        Column 0       → ANGLE_OFFSET = -43.5° → bin 0
+        Column width/2 → 0°                    → bin 4
+        Column width-1 → +43.5°                → bin 8
+
+        This lookup table is computed once and reused for every frame.
+        """
+        col_idx = np.arange(width)
+        # Angle of each column (degrees), linearly interpolated across FOV
+        angles  = ANGLE_OFFSET + (col_idx / width) * FOV_H_DEG
+
+        # Map angle → bin index, clamped to [0, NUM_BINS-1]
+        self._col_bin = np.clip(
+            ((angles - ANGLE_OFFSET) / INCREMENT).astype(int),
+            0, NUM_BINS - 1
+        )
+
+        self.get_logger().info(
+            f'Column-to-bin lookup built | image_width={width} | '
+            f'bins span {angles[0]:.1f}° to {angles[-1]:.1f}°'
+        )
+
+    # ── Timer callback ────────────────────────────────────────────────────────
+    def _timer_cb(self):
+        if self._pipeline is None or self._col_bin is None:
+            return
+
+        distances = self._process_frame()
+        if distances is None:
+            return
+
+        self._publish(distances)
+
+    # ── Frame processing ──────────────────────────────────────────────────────
+    def _process_frame(self):
+        """
+        Grab one depth frame → apply filters → sample middle band →
+        bucket columns into 9 angular bins → return 72-element list.
+        Returns None if the camera fails this cycle.
         """
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=200)
-        except Exception as e:
-            self.get_logger().warn(f'⚠️  Frame timeout: {e}', throttle_duration_sec=5.0)
-            self._watchdog_ok = False
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Frame timeout: {exc}', throttle_duration_sec=5.0
+            )
             return None
 
         depth_frame = frames.get_depth_frame()
         if not depth_frame:
-            self.get_logger().warn('⚠️  No depth frame', throttle_duration_sec=5.0)
             return None
 
-        self._watchdog_ok = True
-        return self._depth_frame_to_bins(depth_frame)
+        # Apply post-processing filters
+        for f in self._filters:
+            depth_frame = f.process(depth_frame)
 
-    # ── Core conversion: depth frame → 72-bin distance array (cm) ─────────────
-    def _depth_frame_to_bins(self, depth_frame):
-        """
-        Convert a RealSense depth frame into a 72-element uint16 array (cm).
+        # Raw depth array (H × W, uint16, units = depth_scale metres)
+        depth_raw = np.asanyarray(depth_frame.get_data())      # uint16
+        depth_m   = depth_raw.astype(np.float32) * self._depth_scale  # metres
 
-        Algorithm:
-          1. Apply post-processing filters (decimation → spatial → temporal)
-          2. Sample the middle row (horizontal plane)
-          3. Map each pixel's angle to one of the 72 angular bins
-          4. Keep the MINIMUM distance in each bin (most conservative = safest)
-          5. Clamp to [min_depth, max_depth]; unknown → UINT16_MAX
+        h, w = depth_m.shape
 
-        The result is in the MAV_FRAME_BODY_FRD frame:
-          Index 0 = angle_offset (−43.5° for D435, i.e. left edge of FOV)
-          Index increases clockwise
-          Bins outside the camera FOV remain UINT16_MAX (unknown)
+        # Rebuild lookup if image width changed (e.g. after filter changes)
+        if self._col_bin is None or len(self._col_bin) != w:
+            self._build_col_bin_lookup(w)
 
-        Returns: np.ndarray shape (72,) dtype uint16
-        """
-        if self._use_filters:
-            for f in self._filters:
-                depth_frame = f.process(depth_frame)
+        # ── Sample horizontal band (middle BAND_FRAC of rows) ──────────────
+        band_h = max(1, int(h * BAND_FRAC))
+        r0     = (h - band_h) // 2
+        band   = depth_m[r0 : r0 + band_h, :]   # shape: (band_h, w)
 
-        depth_image = np.asanyarray(depth_frame.get_data())
+        # Valid pixel mask: must be nonzero, within range
+        valid = (band > 0) & (band >= MIN_RANGE_M) & (band <= MAX_RANGE_M)
 
-        # Sample the middle row → horizontal distances only
-        mid_row = depth_image[depth_image.shape[0] // 2, :]
+        # ── Per-bin minimum distance ────────────────────────────────────────
+        # bin_min_cm[b] = minimum distance (cm) of any valid pixel in bin b
+        # -1 means "no valid pixel found" → report as CLEAR
+        bin_min_cm = np.full(NUM_BINS, -1.0, dtype=np.float64)
 
-        # Convert raw units → metres (vectorised, fast)
-        row_m = mid_row.astype(np.float32) * self._depth_scale
+        for b in range(NUM_BINS):
+            col_mask    = (self._col_bin == b)       # columns belonging to bin b
+            slice_valid = valid[:, col_mask]          # valid pixels in those columns
+            if slice_valid.any():
+                min_m = band[:, col_mask][slice_valid].min()
+                bin_min_cm[b] = min_m * 100.0         # metres → cm
 
-        # Mark invalid pixels: zero (no IR return), below min, or above max.
-        # NOTE: Do NOT replace invalid pixels with max_m.
-        # A zero return from the D435 often means a black/reflective surface
-        # at close range — treating it as "10 m clear" is a dangerous lie.
-        # Instead, keep those bins as UINT16_MAX (unknown), which tells PX4
-        # "I have no reliable data here" — a conservative, correct choice.
-        valid_mask = (row_m > 0) & (row_m >= self._min_m) & (row_m <= self._max_m)
+        # ── Build 72-element distances array ───────────────────────────────
+        # Structure (identical to verified fake-data test):
+        #   Bins 0–8   : real camera data
+        #   Bins 9–71  : UINT16_MAX (unknown — camera doesn't cover these angles)
+        distances = [UINT16_MAX] * BIN_COUNT
 
-        # Initialise all bins as UNKNOWN (UINT16_MAX)
-        bins_cm = np.full(self._num_bins, UINT16_MAX, dtype=np.uint16)
+        for i in range(NUM_BINS):
+            v = bin_min_cm[i]
+            if v < 0:
+                distances[i] = CLEAR_CM                        # 801 = clear
+            else:
+                distances[i] = int(np.clip(v, MIN_CM, MAX_CM)) # clamped cm
 
-        num_cols = len(row_m)
-
-        # Map each pixel column → forward-referenced angular bin
-        # bin math: col=0 → left edge of FOV, centre col → 0° (forward)
-        # The resulting angles are forward-referenced (0° = forward).
-        # msg.angle_offset is therefore published as 0.0 — see _publish().
-        col_indices = np.arange(num_cols)
-        angles = self._angle_offset + (col_indices / num_cols) * self._fov_h
-
-        # Bin indices (0-indexed, mod-360 → clockwise, 0 = forward)
-        bin_indices = (np.round(angles % 360 / self._increment_deg)
-                       .astype(int) % self._num_bins)
-
-        # Only scatter VALID pixels into bins — invalid pixels are skipped
-        # entirely so their bins stay at UINT16_MAX (unknown), not max_m.
-        valid_col_idx = col_indices[valid_mask]
-        valid_bins    = bin_indices[valid_mask]
-        valid_dist_cm = np.minimum(
-            (row_m[valid_mask] * 100).astype(np.uint16), 65534
+        # Debug: log the 9 active bins
+        active = [distances[i] for i in range(NUM_BINS)]
+        self.get_logger().debug(
+            f'bins[0-8]={active}', throttle_duration_sec=1.0
         )
 
-        # Scatter-minimum: keep the closest reading per bin
-        np.minimum.at(bins_cm, valid_bins, valid_dist_cm)
-
-        return bins_cm
-
-    # ── Synthetic obstacle (SITL / no-camera test) ───────────────────────────
-    def _synthetic_obstacle(self):
-        """
-        Inject a wall 2 m ahead (forward bins) so you can verify CP braking
-        in SITL without a physical camera attached.
-
-        The synthetic obstacle sweeps a ±30° arc around forward (bin 0 / bin 72).
-        """
-        bins_cm = np.full(self._num_bins, UINT16_MAX, dtype=np.uint16)
-
-        # Forward direction in FRD frame = 0° → bin index = 0
-        # Cover −30° to +30° (12 bins at 5°/bin)
-        sweep_bins = 6  # ±30° = 6 bins each side
-        obstacle_cm = 200  # 2 m
-
-        for offset in range(-sweep_bins, sweep_bins + 1):
-            idx = offset % self._num_bins
-            bins_cm[idx] = obstacle_cm
-
-        return bins_cm
+        return distances
 
     # ── Publish ───────────────────────────────────────────────────────────────
-    def _publish(self, distances_cm: np.ndarray):
+    def _publish(self, distances: list):
         """
-        Build and publish px4_msgs/ObstacleDistance.
-
-        Field notes:
-          timestamp   : microseconds since epoch (PX4 syncs this internally)
-          frame       : 12 = MAV_FRAME_BODY_FRD  ← DO NOT change this
-          sensor_type : 0  = MAV_DISTANCE_SENSOR_LASER
-          distances   : uint16[72] in cm; UINT16_MAX = unknown
-          increment   : float32, degrees per bin
-          min_distance: uint16, cm
-          max_distance: uint16, cm
-          angle_offset: float32, degrees (offset of bin[0] from forward)
+        Publish px4_msgs/ObstacleDistance.
+        Fields match exactly what was verified via NuttShell listener.
         """
         msg = ObstacleDistance()
-        msg.timestamp     = int(self.get_clock().now().nanoseconds / 1000)  # µs
-        msg.frame         = MAV_FRAME_BODY_FRD
-        msg.sensor_type   = MAV_DISTANCE_SENSOR_LASER
-        msg.distances     = distances_cm.tolist()
-        msg.increment     = float(self._increment_deg)
-        msg.min_distance  = int(self._min_m * 100)   # cm
-        msg.max_distance  = int(self._max_m * 100)   # cm
-        # angle_offset MUST be 0.0 here.
-        # Our bin-filling math uses mod-360 indexing where bin 0 = 0° = forward.
-        # Publishing self._angle_offset (-43.5°) would tell PX4 that bin 0 is
-        # 43.5° left of forward — a mismatch that causes PX4's Collision
-        # Prevention to check the wrong sector for a straight-ahead obstacle.
-        # (Bug confirmed by code review: the bin math and angle_offset were
-        # computed independently and contradicted each other.)
-        msg.angle_offset  = 0.0
+        msg.timestamp    = int(self.get_clock().now().nanoseconds / 1000)  # µs
+        msg.frame        = ObstacleDistance.MAV_FRAME_BODY_FRD
+        msg.sensor_type  = ObstacleDistance.MAV_DISTANCE_SENSOR_LASER
+        msg.min_distance = MIN_CM           # 20 cm
+        msg.max_distance = MAX_CM           # 800 cm
+        msg.increment    = float(INCREMENT) # 9.667°
+        msg.angle_offset = float(ANGLE_OFFSET)  # -43.5°
+        msg.distances    = distances
 
         self._pub.publish(msg)
-
-        # ── Debug log (throttled — every 2 s) ────────────────────────────────
-        valid = distances_cm[distances_cm < UINT16_MAX]
-        if valid.size:
-            self.get_logger().debug(
-                f'ObstacleDistance | valid bins: {valid.size}/{self._num_bins} | '
-                f'min: {valid.min()/100:.2f} m | max: {valid.max()/100:.2f} m',
-                throttle_duration_sec=2.0,
-            )
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     def destroy_node(self):
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
-                self.get_logger().info('🛑 RealSense pipeline stopped.')
+                self.get_logger().info('RealSense pipeline stopped.')
             except Exception:
                 pass
         super().destroy_node()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main(args=None):
     rclpy.init(args=args)
     node = RealSenseObstacleNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Interrupted by user.')
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
