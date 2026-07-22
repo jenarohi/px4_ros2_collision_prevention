@@ -1,6 +1,15 @@
 # px4_ros2_collision_prevention
 
-A **ROS 2 Humble** node that reads a RealSense D435/D435i depth stream and
+A **ROS 2 Humble** package that bridges Intel RealSense D435/D435i depth data
+to PX4's native **Collision Prevention** module via the uXRCE-DDS bridge.
+
+Contains two nodes:
+
+| Node | Input | Purpose |
+|---|---|---|
+| `realsense_obstacle_node` | Live D435 depth stream | Real-time obstacle avoidance |
+| `depth_replay_node` | Recorded `.xlsx` depth frames | Replay & validate without hardware |
+
 publishes `px4_msgs/ObstacleDistance` messages to PX4's native **Collision
 Prevention** module via the uXRCE-DDS bridge.
 
@@ -149,9 +158,71 @@ listener obstacle_distance
 
 ---
 
-## Launch File
+## Depth Replay Node  (`depth_replay_node`)
+
+Replays **pre-recorded** RealSense depth frames (`.xlsx` files) as
+`ObstacleDistance` messages — no camera, no SITL required.
+Useful for:
+- Validating CP behaviour against a known real-world scenario
+- Regression testing after firmware/node changes
+- HIL / CI environments without physical hardware
+
+### Python dependency
 ```bash
-ros2 launch px4_ros2_collision_prevention obstacle_avoidance.launch.py
+pip install openpyxl numpy
+```
+
+### Quick start
+```bash
+# Terminal 1: XRCE-DDS agent
+MicroXRCEAgent udp4 --port 8888
+
+# Terminal 2: Replay node
+ros2 run px4_ros2_collision_prevention depth_replay_node \
+  --ros-args -p data_dir:=/path/to/depthdata_frames
+
+# With loop + custom rate
+ros2 run px4_ros2_collision_prevention depth_replay_node \
+  --ros-args \
+    -p data_dir:=/path/to/depthdata_frames \
+    -p loop:=true \
+    -p publish_hz:=15.0
+
+# Using launch file
+ros2 launch px4_ros2_collision_prevention depth_replay.launch.py \
+    data_dir:=/path/to/depthdata_frames loop:=true
+```
+
+### Expected depth frame format
+- Files named `depthdata_filter_<N>.xlsx`  (N = frame index)
+- Shape: **270 rows × 480 cols**  (RealSense half-resolution)
+- Units: **millimetres** (float)
+- Zero values = invalid / no return
+
+### Replay Node Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `data_dir` | `''` | **Required.** Path to folder with `depthdata_filter_*.xlsx` |
+| `publish_hz` | `10.0` | Publish rate (Hz). PX4 CP needs ≥ 10 Hz |
+| `loop` | `false` | Loop the dataset indefinitely |
+| `fov_h_deg` | `87.0` | Camera horizontal FOV (degrees) |
+| `num_bins` | `9` | Angular bins across the FOV |
+| `min_depth_m` | `0.20` | Minimum valid depth (m) |
+| `max_depth_m` | `8.00` | Maximum valid depth (m) |
+| `depth_percentile` | `10` | Nth-percentile depth per bin (noise robust) |
+| `min_pixels_per_bin` | `5` | Min valid pixels to report a bin distance |
+
+### Verify replay is reaching PX4
+```bash
+# Should publish at publish_hz
+ros2 topic hz /fmu/in/obstacle_distance
+
+# See distances without array spam
+ros2 topic echo /fmu/in/obstacle_distance --no-arr
+
+# In QGC MAVLink console:
+listener obstacle_distance
 ```
 
 ---
@@ -199,11 +270,14 @@ ros2 launch px4_ros2_collision_prevention obstacle_avoidance.launch.py
 px4_ros2_collision_prevention/
 ├── px4_ros2_collision_prevention/
 │   ├── __init__.py
-│   └── realsense_obstacle_node.py    ← Main ROS2 node
+│   ├── realsense_obstacle_node.py    ← Live D435 camera → ObstacleDistance
+│   └── depth_replay_node.py          ← Recorded xlsx frames → ObstacleDistance
 ├── launch/
-│   └── obstacle_avoidance.launch.py  ← Launch file
+│   ├── obstacle_avoidance.launch.py  ← Launch live camera node
+│   └── depth_replay.launch.py        ← Launch recorded data replay node
 ├── config/
-│   └── params.yaml                   ← Default parameters
+│   ├── params.yaml                   ← Parameters for live camera node
+│   └── replay_params.yaml            ← Parameters for depth replay node
 ├── test/
 │   └── test_depth_to_bins.py         ← Unit tests (no hardware needed)
 ├── package.xml

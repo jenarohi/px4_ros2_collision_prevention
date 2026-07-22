@@ -6,7 +6,7 @@ package_name = 'px4_ros2_collision_prevention'
 
 setup(
     name=package_name,
-    version='1.0.0',
+    version='1.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -30,6 +30,8 @@ setup(
         'console_scripts': [
             'realsense_obstacle_node = '
             'px4_ros2_collision_prevention.realsense_obstacle_node:main',
+            'depth_replay_node = '
+            'px4_ros2_collision_prevention.depth_replay_node:main',
         ],
     },
 )

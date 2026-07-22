@@ -1,0 +1,34 @@
+depth_replay_node:
+  ros__parameters:
+    # ── Playback ──────────────────────────────────────────────────────────────
+    # Path to folder containing depthdata_filter_N.xlsx files.
+    # Override with:  --ros-args -p data_dir:=/your/path
+    #             or: data_dir:=/your/path  (in launch file)
+    data_dir: ''
+
+    # Replay rate. PX4 CP needs >= 10 Hz. 10 Hz matches typical D435 recording.
+    publish_hz: 10.0
+
+    # Loop the dataset forever (useful for SITL continuous testing).
+    loop: false
+
+    # ── Camera geometry ───────────────────────────────────────────────────────
+    # D435 / D435i horizontal FOV = 87° (depth stream)
+    fov_h_deg: 87.0
+
+    # Angular sectors across the camera FOV.
+    # 9 bins × ~9.7°/bin ≈ 87° total — matches live realsense_obstacle_node.
+    num_bins: 9
+
+    # ── Sensor range ──────────────────────────────────────────────────────────
+    min_depth_m: 0.20
+    max_depth_m: 8.00
+
+    # ── Noise robustness ──────────────────────────────────────────────────────
+    # Use Nth-percentile depth per bin instead of raw minimum.
+    # 10th percentile = conservative (close to min) but ignores hot pixels.
+    depth_percentile: 10
+
+    # Minimum number of valid pixels in a bin to report a distance.
+    # Bins with fewer pixels → UNKNOWN (65535). Prevents reporting on single-pixel noise.
+    min_pixels_per_bin: 5
